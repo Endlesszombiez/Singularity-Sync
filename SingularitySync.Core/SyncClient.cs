@@ -17,9 +17,12 @@ public sealed class SyncClient : IAsyncDisposable
     private Task? runner;
     private long sequence;
     public Binding Binding { get; private set; }
+    public SyncActivity Activity { get; }
+    private string? serverName;
     private string StatePath => Path.Combine(store.Metadata, "client-state.json");
-    public SyncClient(string folder, Binding binding, Action<string>? log = null, Action<Binding>? saveBinding = null)
+    public SyncClient(string folder, Binding binding, Action<string>? log = null, Action<Binding>? saveBinding = null, SyncActivity? activity = null)
     {
+        Activity = activity ?? new();
         Binding = binding; this.log = log ?? (_ => { }); this.saveBinding = saveBinding ?? (_ => { });
         store = new(folder);
         try
@@ -58,10 +61,12 @@ public sealed class SyncClient : IAsyncDisposable
         var request = new HttpRequestMessage(method, new Uri(Address(Binding.Address, Binding.Port, "/"), path));
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Binding.Token);
         request.Headers.Add("X-Sync-Folder", Binding.FolderId);
+        request.Headers.Add("X-Sync-Name", Uri.EscapeDataString(Environment.MachineName));
         return request;
     }
-    private static void Check(HttpResponseMessage response)
+    private void Check(HttpResponseMessage response)
     {
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.PreconditionFailed) Activity.Offline(Binding.ServerId);
         if (response.StatusCode == HttpStatusCode.Unauthorized) throw new IOException("Pairing was revoked. Stop and pair with the server again.");
         if (response.StatusCode == HttpStatusCode.PreconditionFailed) throw new IOException("The server is sharing a different folder. Choose a new client folder and pair again.");
         if (response.StatusCode == HttpStatusCode.Conflict) throw new IOException("A file changed during transfer; retrying safely.");
@@ -77,7 +82,7 @@ public sealed class SyncClient : IAsyncDisposable
             try
             {
                 var info = await http.GetFromJsonAsync<ServerInfo>(Address(Binding.Address, Binding.Port, "/info"), Protocol.Json, timeout.Token);
-                if (info is not null && Matches(info)) return;
+                if (info is not null && Matches(info)) { serverName = info.Name; return; }
             }
             catch (Exception e) when (e is HttpRequestException or OperationCanceledException) { ct.ThrowIfCancellationRequested(); }
         }
@@ -91,6 +96,7 @@ public sealed class SyncClient : IAsyncDisposable
             {
                 var info = await http.GetFromJsonAsync<ServerInfo>(Address(server.Address, server.Info.Port, "/info"), Protocol.Json, timeout.Token);
                 if (info is null || !Matches(info)) continue;
+                serverName = info.Name;
                 Binding = Binding with { Address = server.Address, Port = server.Info.Port, Macs = info.Macs };
                 saveBinding(Binding);
                 log("Reconnected to " + info.Name + " at " + server.Address);
@@ -129,6 +135,7 @@ public sealed class SyncClient : IAsyncDisposable
             catch (OperationCanceledException) when (stop.IsCancellationRequested) { break; }
             catch (Exception e)
             {
+                if (e is HttpRequestException or OperationCanceledException) Activity.Offline(Binding.ServerId);
                 wasOffline = true; log(e.Message);
                 try { await Task.Delay(2000, stop.Token); } catch (OperationCanceledException) { break; }
             }
@@ -143,6 +150,7 @@ public sealed class SyncClient : IAsyncDisposable
             using var response = await http.SendAsync(request, ct); Check(response);
             var manifest = await response.Content.ReadFromJsonAsync<Manifest>(Protocol.Json, ct) ?? throw new IOException("Invalid manifest.");
             if (manifest.FolderId != Binding.FolderId) throw new IOException("Server folder identity changed.");
+            Activity.Seen(Binding.ServerId, serverName, Binding.Address);
             var remote = manifest.Files.ToDictionary(f => f.Path, StringComparer.OrdinalIgnoreCase);
             foreach (string path in remote.Keys) store.Resolve(path);
             var local = store.Scan();
@@ -179,6 +187,7 @@ public sealed class SyncClient : IAsyncDisposable
             }
             sequence = manifest.Sequence;
         }
+        catch (HttpRequestException) { Activity.Offline(Binding.ServerId); throw; }
         finally { cycle.Release(); }
     }
     private void Remember(string path, FileEntry? entry)
@@ -190,6 +199,7 @@ public sealed class SyncClient : IAsyncDisposable
     }
     private async Task<FileEntry?> UploadAsync(string path, string? hash, string? expectedVersion, CancellationToken ct)
     {
+        using var transfer = Activity.Begin(Binding.ServerId, serverName, Binding.Address, true);
         using var request = Request(hash is null ? HttpMethod.Delete : HttpMethod.Put, "/file?path=" + Uri.EscapeDataString(path));
         request.Headers.Add("X-Expected-Version", expectedVersion ?? "missing");
         FileStream? stream = null;
@@ -200,7 +210,7 @@ public sealed class SyncClient : IAsyncDisposable
                 stream = store.OpenRead(path);
                 if (FolderStore.Hash(stream) != hash) throw new IOException("File is still changing: " + path);
                 stream.Position = 0;
-                request.Content = new StreamContent(stream, 128 * 1024);
+                request.Content = new StreamContent(new CountingStream(stream, n => Activity.Add(Binding.ServerId, n, true), leaveOpen: true), 128 * 1024);
                 request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
                 request.Headers.Add("X-Content-SHA256", hash);
             }
@@ -214,13 +224,17 @@ public sealed class SyncClient : IAsyncDisposable
     private async Task DownloadAsync(string path, FileEntry? entry, string? expectedHash, CancellationToken ct)
     {
         if (entry?.Hash is null) { store.Apply(path, null, expectedHash); log("Deleted locally (recovery copy retained): " + path); return; }
+        using var transfer = Activity.Begin(Binding.ServerId, serverName, Binding.Address, true);
         string temp = store.NewTemp();
         try
         {
             using var request = Request(HttpMethod.Get, "/file?path=" + Uri.EscapeDataString(path) + "&version=" + Uri.EscapeDataString(entry.Version));
             using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct); Check(response);
             await using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, true))
-                await response.Content.CopyToAsync(output, ct);
+            {
+                await using var counted = new CountingStream(output, n => Activity.Add(Binding.ServerId, n, false), leaveOpen: true);
+                await response.Content.CopyToAsync(counted, ct);
+            }
             using (var input = File.OpenRead(temp))
                 if (input.Length != entry.Length || FolderStore.Hash(input) != entry.Hash) throw new IOException("Transfer checksum mismatch: " + path);
             store.Apply(path, temp, expectedHash);
@@ -232,6 +246,7 @@ public sealed class SyncClient : IAsyncDisposable
     {
         stop.Cancel(); watcher.Dispose();
         if (runner is not null) await runner;
+        Activity.Offline(Binding.ServerId);
         http.Dispose(); store.Dispose(); stop.Dispose();
     }
 }

@@ -23,13 +23,15 @@ public sealed class SyncServer : IAsyncDisposable
     private FileSystemWatcher? watcher;
     private Task? monitor, discovery;
     public int Port { get; }
+    public SyncActivity Activity { get; }
     public string PairingCode { get; private set; } = "";
     public DateTime CodeExpiresUtc { get; private set; }
     public ServerInfo Info => new(settings.DeviceId, Environment.MachineName, Protocol.MacAddresses(), Port, state.FolderId);
     private string StatePath => Path.Combine(store.Metadata, "server-state.json");
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
-    public SyncServer(string folder, Settings settings, Action<string>? log = null, int port = Protocol.HttpPort, Action? saveSettings = null)
+    public SyncServer(string folder, Settings settings, Action<string>? log = null, int port = Protocol.HttpPort, Action? saveSettings = null, SyncActivity? activity = null)
     {
+        Activity = activity ?? new();
         this.settings = settings; pairingLock = settings; this.log = log ?? (_ => { }); this.saveSettings = saveSettings ?? settings.Save; Port = port;
         store = new(folder);
         try
@@ -51,7 +53,7 @@ public sealed class SyncServer : IAsyncDisposable
     }
     public void ForgetClients()
     {
-        lock (pairingLock) { settings.Clients.Clear(); saveSettings(); }
+        lock (pairingLock) { settings.Clients.Clear(); Activity.ClearPeers(); saveSettings(); }
         RotatePairingCode();
     }
     public async Task StartAsync(bool enableDiscovery = true)
@@ -69,10 +71,17 @@ public sealed class SyncServer : IAsyncDisposable
                 if (context.Request.Path != "/info" && context.Request.Path != "/pair")
                 {
                     string token = context.Request.Headers.Authorization.ToString();
-                    bool allowed;
-                    lock (pairingLock) allowed = token.StartsWith("Bearer ", StringComparison.Ordinal) && settings.Clients.Values.Contains(token[7..]);
-                    if (!allowed) { context.Response.StatusCode = 401; return; }
+                    string? peerId;
+                    lock (pairingLock) peerId = token.StartsWith("Bearer ", StringComparison.Ordinal) ? settings.Clients.FirstOrDefault(p => p.Value == token[7..]).Key : null;
+                    if (peerId is null) { context.Response.StatusCode = 401; return; }
                     if (context.Request.Headers["X-Sync-Folder"] != state.FolderId) { context.Response.StatusCode = 412; return; }
+                    string? name = null;
+                    string encodedName = context.Request.Headers["X-Sync-Name"].ToString();
+                    if (encodedName.Length <= 1024) name = Uri.UnescapeDataString(encodedName);
+                    using var presence = Activity.Begin(peerId, name, context.Connection.RemoteIpAddress?.ToString() ?? "", context.Request.Path == "/file");
+                    context.Items["SyncPeerId"] = peerId;
+                    await next(context);
+                    return;
                 }
                 await next(context);
             }
@@ -130,7 +139,7 @@ public sealed class SyncServer : IAsyncDisposable
                 {
                     if (FolderStore.Hash(stream) != entry.Hash) { stream.Dispose(); return Results.Conflict(); }
                     stream.Position = 0;
-                    return Results.Stream(stream, "application/octet-stream");
+                    return Results.Stream(new CountingStream(stream, n => Activity.Add((string)context.Items["SyncPeerId"]!, n, true)), "application/octet-stream");
                 }
                 catch { stream.Dispose(); throw; }
             }
@@ -143,7 +152,10 @@ public sealed class SyncServer : IAsyncDisposable
             try
             {
                 await using (var output = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, true))
-                    await context.Request.Body.CopyToAsync(output, context.RequestAborted);
+                {
+                    await using var counted = new CountingStream(output, n => Activity.Add((string)context.Items["SyncPeerId"]!, n, false), leaveOpen: true);
+                    await context.Request.Body.CopyToAsync(counted, context.RequestAborted);
+                }
                 string hash;
                 using (var input = File.OpenRead(temp)) hash = FolderStore.Hash(input);
                 if (context.Request.Headers["X-Content-SHA256"] != hash) return Results.BadRequest("Content checksum mismatch.");
@@ -242,6 +254,7 @@ public sealed class SyncServer : IAsyncDisposable
         if (app is not null) { await app.StopAsync(); await app.DisposeAsync(); }
         if (monitor is not null) await monitor;
         if (discovery is not null) await discovery;
+        Activity.Stop();
         store.Dispose(); stop.Dispose();
     }
 }

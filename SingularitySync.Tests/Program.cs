@@ -5,6 +5,15 @@ using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using SingularitySync.Core;
+using SingularitySync.App;
+
+if (args.Length == 2 && args[0] == "--mutex-child")
+{
+    using var ownership = SingleInstance.TryAcquire(args[1]);
+    Console.WriteLine(ownership is null ? "blocked" : "acquired");
+    Console.ReadLine();
+    return;
+}
 
 var root = Path.Combine(Path.GetTempPath(), "SingularitySync-tests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
@@ -29,8 +38,53 @@ async Task Eventually(Func<bool> condition, string label, int milliseconds = 800
     while (!condition() && sw.ElapsedMilliseconds < milliseconds) await Task.Delay(50);
     Assert(condition(), label + $" ({sw.ElapsedMilliseconds} ms)");
 }
+async Task CheckSingleInstance(bool crash)
+{
+    string name = @"Global\SingularitySync.Tests." + Guid.NewGuid().ToString("N");
+    var start = new ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+    if (Path.GetFileNameWithoutExtension(start.FileName).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+        start.ArgumentList.Add(typeof(SingleInstance).Assembly.Location);
+    start.ArgumentList.Add("--mutex-child"); start.ArgumentList.Add(name);
+    using var child = Process.Start(start)!;
+    try
+    {
+        string? ready = await child.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        if (ready != "acquired") throw new Exception("Could not start singleton test holder: " + ready);
+        // Keep the kernel object alive to exercise abandoned-mutex recovery after a crash.
+        using var observer = Mutex.OpenExisting(name);
+        using (var duplicate = SingleInstance.TryAcquire(name))
+            Assert(duplicate is null, "second process blocked" + (crash ? " before crash" : " while running"));
+        if (crash) child.Kill();
+        else await child.StandardInput.WriteLineAsync("exit");
+        await child.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        using var next = SingleInstance.TryAcquire(name);
+        Assert(next is not null, crash ? "singleton lock recovers after process crash" : "singleton lock released after normal exit");
+    }
+    finally { if (!child.HasExited) { child.Kill(); await child.WaitForExitAsync(); } }
+}
 try
 {
+    var clock = new TestClock();
+    var telemetry = new SyncActivity(clock);
+    using (telemetry.Begin("peer", "Office PC", "192.0.2.1", true))
+    {
+        Parallel.For(0, 1000, _ => telemetry.Add("peer", 100, true));
+        telemetry.Add("peer", 200, false);
+        var sample = telemetry.Snapshot();
+        Assert(sample.Uploaded == 100_000 && sample.Downloaded == 200 && sample.UploadRate == 50_000 && sample.DownloadRate == 100, "concurrent byte counters and rate calculation");
+        Assert(sample.Peers.Single().Status == "Syncing", "active transfer shows syncing");
+    }
+    Assert(telemetry.Snapshot().Peers.Single().Status == "Idle", "completed transfer shows idle");
+    clock.Advance(TimeSpan.FromSeconds(3));
+    Assert(telemetry.Snapshot().UploadRate == 0 && telemetry.Snapshot().Uploaded == 100_000, "idle rates decay without losing session totals");
+    clock.Advance(TimeSpan.FromSeconds(43));
+    Assert(telemetry.Snapshot().Peers.Single().Status == "Offline", "silent peers expire after 45 seconds");
+    telemetry.Seen("peer", "Renamed PC", "192.0.2.2");
+    Assert(telemetry.Snapshot().Peers.Single() is { Name: "Renamed PC", Status: "Idle", Address: "192.0.2.2" }, "peer reconnect updates name and address");
+    telemetry.Stop();
+    Assert(telemetry.Snapshot().Peers.Single().Status == "Offline" && telemetry.Snapshot().Uploaded == 100_000, "stop marks peers offline and retains totals");
+    await CheckSingleInstance(false);
+    await CheckSingleInstance(true);
     string sf = Folder("server"), cf1 = Folder("client1"), cf2 = Folder("client2");
     File.WriteAllText(Path.Combine(sf, "hello.txt"), "server original");
     File.WriteAllText(Path.Combine(cf1, "local.txt"), "client original");
@@ -48,14 +102,23 @@ try
     http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", b1.Token);
     http.DefaultRequestHeaders.Add("X-Sync-Folder", b1.FolderId);
     client1 = new(cf1, b1); client2 = new(cf2, b2);
+    await client1.EnsureConnectedAsync(CancellationToken.None);
     await client1.SyncOnceAsync(); await client2.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(cf1, "hello.txt")) == "server original" && File.ReadAllText(Path.Combine(sf, "local.txt")) == "client original" && File.Exists(Path.Combine(cf2, "local.txt")), "initial two-way merge and fan-out");
+    var initialServer = server.Activity.Snapshot();
+    var initialClient1 = client1.Activity.Snapshot();
+    var initialClient2 = client2.Activity.Snapshot();
+    Assert(initialServer.Peers.Count == 2 && initialServer.Peers.All(p => p.Name == Environment.MachineName && p.Status == "Idle"), "authenticated clients report PC names and idle status");
+    Assert(initialClient1.Peers.Single().Name == Environment.MachineName, "client shows server PC name");
+    Assert(initialClient1.Uploaded == new FileInfo(Path.Combine(cf1, "local.txt")).Length && initialClient1.Downloaded == new FileInfo(Path.Combine(sf, "hello.txt")).Length, "initial counters count file payload only");
+    Assert(initialServer.Uploaded == initialClient1.Downloaded + initialClient2.Downloaded && initialServer.Downloaded == initialClient1.Uploaded + initialClient2.Uploaded, "server counters match both clients in opposite directions");
     Directory.CreateDirectory(Path.Combine(cf1, "nested"));
     byte[] bytes = RandomNumberGenerator.GetBytes(4 * 1024 * 1024);
     File.WriteAllBytes(Path.Combine(cf1, "nested", "日本語 #%.bin"), bytes);
     File.WriteAllBytes(Path.Combine(cf1, "empty.txt"), []);
     await client1.SyncOnceAsync(); await client2.SyncOnceAsync();
     Assert(File.ReadAllBytes(Path.Combine(cf2, "nested", "日本語 #%.bin")).SequenceEqual(bytes) && new FileInfo(Path.Combine(cf2, "empty.txt")).Length == 0, "binary streaming, nested Unicode paths, and zero-byte files");
+    Assert(client1.Activity.Snapshot().Uploaded - initialClient1.Uploaded == bytes.Length && client2.Activity.Snapshot().Downloaded - initialClient2.Downloaded == bytes.Length, "streaming counters count binary and empty files exactly once");
     File.WriteAllText(Path.Combine(sf, "hello.txt"), "server edited");
     await client1.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(cf1, "hello.txt")) == "server edited", "server edits reach client");
@@ -122,14 +185,18 @@ try
         using var response = await http.SendAsync(traversal);
         Assert(response.StatusCode == HttpStatusCode.Conflict && !File.Exists(Path.Combine(root, "escape.txt")), "network path traversal blocked");
     }
+    long receivedBeforeInterruption = server.Activity.Snapshot().Downloaded;
     using (var socket = new TcpClient())
     {
         await socket.ConnectAsync(IPAddress.Loopback, port);
         string header = $"PUT /file?path=renamed.txt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {b1.Token}\r\nX-Sync-Folder: {b1.FolderId}\r\nX-Expected-Version: {entry.Version}\r\nX-Content-SHA256: unused\r\nContent-Length: 100000\r\n\r\npartial";
         await socket.GetStream().WriteAsync(System.Text.Encoding.ASCII.GetBytes(header));
         await Eventually(() => Directory.EnumerateFiles(Path.Combine(sf, ".singularity-sync", "tmp")).Any(), "interrupted upload enters staging");
+        await Eventually(() => server.Activity.Snapshot().Downloaded == receivedBeforeInterruption + 7, "partial transfer is counted before completion");
+        Assert(server.Activity.Snapshot().Peers.Any(p => p.Status == "Syncing"), "in-flight network upload shows syncing");
     }
     await Eventually(() => !Directory.EnumerateFiles(Path.Combine(sf, ".singularity-sync", "tmp")).Any(), "interrupted upload staging is cleaned up");
+    await Eventually(() => server.Activity.Snapshot().Peers.All(p => p.Status == "Idle"), "interrupted transfer releases syncing status");
     Assert(File.ReadAllText(Path.Combine(sf, "renamed.txt")) == "remote survives", "interrupted transfer leaves destination intact");
     File.WriteAllText(Path.Combine(sf, "simultaneous.txt"), "baseline");
     await client1.SyncOnceAsync(); await client2.SyncOnceAsync();
@@ -175,6 +242,7 @@ try
     await Eventually(() => File.Exists(Path.Combine(sf, "watch-client.txt")), "client watcher uploads automatically");
     await client1.DisposeAsync(); client1 = null;
     server.ForgetClients();
+    Assert(server.Activity.Snapshot().Peers.Count == 0, "revocation removes peers from activity");
     client1 = new(cf1, b1);
     await Throws(() => client1.SyncOnceAsync(), "revoked token is rejected");
     Console.WriteLine($"\nAll {passed} checks passed.");
@@ -186,4 +254,11 @@ finally
     if (server is not null) await server.DisposeAsync();
     // Only delete the uniquely generated temporary test directory.
     if (Path.GetDirectoryName(root) == Path.TrimEndingDirectorySeparator(Path.GetTempPath()) && Path.GetFileName(root).StartsWith("SingularitySync-tests-")) Directory.Delete(root, true);
+}
+
+sealed class TestClock : TimeProvider
+{
+    private DateTimeOffset now = new(2026, 9, 12, 12, 0, 0, TimeSpan.Zero);
+    public override DateTimeOffset GetUtcNow() => now;
+    public void Advance(TimeSpan duration) => now += duration;
 }

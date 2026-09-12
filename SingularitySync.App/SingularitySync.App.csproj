@@ -5,8 +5,10 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <ApplicationIcon>Assets/SingularitySync.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>SingularitySync</AssemblyName>
   </PropertyGroup>
+  <ItemGroup><EmbeddedResource Include="Assets/SingularitySync.ico" LogicalName="SingularitySync.AppIcon" /></ItemGroup>
   <ItemGroup><ProjectReference Include="../SingularitySync.Core/SingularitySync.Core.csproj" /></ItemGroup>
 </Project>

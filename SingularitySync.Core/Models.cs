@@ -46,6 +46,7 @@ public sealed class Settings
     public string DeviceId { get; set; } = Guid.NewGuid().ToString("N");
     public string Mode { get; set; } = "Server";
     public string Folder { get; set; } = "";
+    public bool StartServerAtLogin { get; set; }
     public Binding? Binding { get; set; }
     public Dictionary<string, string> Clients { get; set; } = new();
     public static string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SingularitySync", "settings.json");
