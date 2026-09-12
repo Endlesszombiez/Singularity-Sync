@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="SingularitySync.App/SingularitySync.App.csproj" />
+  <Project Path="SingularitySync.Core/SingularitySync.Core.csproj" />
+  <Project Path="SingularitySync.Tests/SingularitySync.Tests.csproj" />
+</Solution>
