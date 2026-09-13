@@ -4,11 +4,12 @@ $ErrorActionPreference = 'Stop'
 $resolvedProgram = (Resolve-Path -LiteralPath $ProgramPath).Path
 if ([IO.Path]::GetFileName($resolvedProgram) -ne 'SingularitySync.exe') { throw 'Select the published SingularitySync.exe.' }
 foreach ($rule in @(
-    @{ Name = 'SingularitySync-LAN-TCP'; Protocol = 'TCP'; Port = 45831 },
-    @{ Name = 'SingularitySync-LAN-UDP'; Protocol = 'UDP'; Port = 45832 }
+    @{ Name = 'SingularitySync-LAN-TCP'; Protocol = 'TCP'; LocalPort = 45831; RemotePort = 'Any' },
+    @{ Name = 'SingularitySync-LAN-UDP'; Protocol = 'UDP'; LocalPort = 45832; RemotePort = 'Any' },
+    @{ Name = 'SingularitySync-LAN-UDP-Replies'; Protocol = 'UDP'; LocalPort = 'Any'; RemotePort = 45832 }
 )) {
     $existing = Get-NetFirewallRule -Name $rule.Name -ErrorAction SilentlyContinue
     if ($existing) { $existing | Remove-NetFirewallRule }
-    New-NetFirewallRule -Name $rule.Name -DisplayName $rule.Name -Direction Inbound -Action Allow -Profile Private -Protocol $rule.Protocol -LocalPort $rule.Port -RemoteAddress LocalSubnet -Program $resolvedProgram | Out-Null
+    New-NetFirewallRule -Name $rule.Name -DisplayName $rule.Name -Direction Inbound -Action Allow -Profile Private -Protocol $rule.Protocol -LocalPort $rule.LocalPort -RemotePort $rule.RemotePort -RemoteAddress LocalSubnet -Program $resolvedProgram | Out-Null
 }
 Write-Host 'Private-network, local-subnet rules created for this executable. Keep the executable at this location.'

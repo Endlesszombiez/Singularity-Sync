@@ -10,6 +10,7 @@ namespace SingularitySync.Core;
 public sealed class SyncServer : IAsyncDisposable
 {
     private readonly FolderStore store;
+    private readonly FileHistory history;
     private readonly Settings settings;
     private readonly Action<string> log;
     private readonly Action saveSettings;
@@ -36,6 +37,7 @@ public sealed class SyncServer : IAsyncDisposable
         store = new(folder);
         try
         {
+            history = new(store);
             state = DiskJson.Read<ServerState>(StatePath) ?? new();
             state.Files = new(state.Files, StringComparer.OrdinalIgnoreCase);
             DiskJson.Write(StatePath, state);
@@ -165,7 +167,7 @@ public sealed class SyncServer : IAsyncDisposable
                     store.Invalidate(); Scan();
                     state.Files.TryGetValue(path, out var previous);
                     if (context.Request.Headers["X-Expected-Version"] != (previous?.Version ?? "missing")) return Results.Conflict();
-                    store.Apply(path, temp, previous?.Hash);
+                    store.Apply(path, temp, previous?.Hash, retainRecovery: false);
                     Scan();
                     log("Received " + path);
                     return Results.Json(state.Files[path], Protocol.Json);
@@ -182,9 +184,9 @@ public sealed class SyncServer : IAsyncDisposable
                 store.Invalidate(); Scan();
                 state.Files.TryGetValue(path, out var previous);
                 if (context.Request.Headers["X-Expected-Version"] != (previous?.Version ?? "missing")) return Results.Conflict();
-                store.Apply(path, null, previous?.Hash);
+                store.Apply(path, null, previous?.Hash, retainRecovery: false);
                 Scan();
-                log("Deleted " + path + " (recovery copy retained)");
+                log("Deleted " + path + " (file history retained)");
                 return Results.Json(state.Files.GetValueOrDefault(path), Protocol.Json);
             }
             finally { gate.Release(); }
@@ -227,6 +229,9 @@ public sealed class SyncServer : IAsyncDisposable
     private void Scan()
     {
         var current = store.Scan();
+        // Seed existing files too, including when upgrading an existing server state.
+        // A failed snapshot must not publish a revision that has no history.
+        foreach (var file in current.Values) history.Capture(file);
         bool dirty = false;
         foreach (var file in current.Values)
         {

@@ -110,17 +110,26 @@ public sealed class FolderStore : IDisposable
         Directory.CreateDirectory(dir);
         return Path.Combine(dir, Guid.NewGuid().ToString("N"));
     }
-    public void Apply(string relative, string? temp, string? expectedHash)
+    public void Apply(string relative, string? temp, string? expectedHash, bool retainRecovery = true)
     {
         string target = Resolve(relative);
         if (CurrentHash(relative) != expectedHash) throw new IOException("File changed during sync; retrying: " + relative);
         if (File.Exists(target))
         {
-            string backup = Path.Combine(Metadata, "recovery", DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff") + "-" + Guid.NewGuid().ToString("N"), relative.Replace('/', Path.DirectorySeparatorChar));
-            EnsureNoLinks(backup);
-            Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-            if (temp is null) File.Move(target, backup);
-            else File.Replace(temp, target, backup);
+            if (!retainRecovery)
+            {
+                // The server has already captured the verified current content in FileHistory.
+                if (temp is null) File.Delete(target);
+                else File.Replace(temp, target, null);
+            }
+            else
+            {
+                string backup = Path.Combine(Metadata, "recovery", DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff") + "-" + Guid.NewGuid().ToString("N"), relative.Replace('/', Path.DirectorySeparatorChar));
+                EnsureNoLinks(backup);
+                Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+                if (temp is null) File.Move(target, backup);
+                else File.Replace(temp, target, backup);
+            }
         }
         else if (temp is not null)
         {

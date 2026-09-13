@@ -16,6 +16,7 @@ public sealed class MainForm : Form
     private readonly Label status = new() { Text = "Stopped", AutoSize = true, ForeColor = Color.FromArgb(80, 95, 115), Margin = new(12, 10, 0, 0) };
     private readonly Label code = new() { Text = "Start the server to generate a code", AutoSize = true, Font = new("Segoe UI", 15, FontStyle.Bold), Margin = new(0, 8, 0, 8) };
     private readonly Label addresses = new() { AutoSize = true, MaximumSize = new(680, 0), Text = "The server owns the shared folder. Paired clients can read, edit, and delete its files." };
+    private readonly Button openHistory = MakeButton("Open file history");
     private readonly Button rotate = MakeButton("New pairing code"), revoke = MakeButton("Forget all clients");
     private readonly ComboBox servers = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 465 };
     private readonly Button search = MakeButton("Search LAN");
@@ -90,7 +91,7 @@ public sealed class MainForm : Form
         serverContent.Controls.Add(code);
         addresses.MaximumSize = new(620, 0); addresses.Margin = new(0, 8, 0, 12);
         serverContent.Controls.Add(addresses);
-        serverContent.Controls.Add(Row(rotate, revoke)); serverPanel.Controls.Add(serverContent);
+        serverContent.Controls.Add(Row(rotate, revoke, openHistory)); serverPanel.Controls.Add(serverContent);
         var clientContent = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5 };
         foreach (int height in new[] { 28, 44, 28, 80, 50 }) clientContent.RowStyles.Add(new(SizeType.Absolute, height));
         clientContent.Controls.Add(Caption("Connect to a server"), 0, 0);
@@ -174,6 +175,15 @@ public sealed class MainForm : Form
             });
         };
         browse.Click += (_, _) => { using var dialog = new FolderBrowserDialog { Description = "Choose the local folder to synchronize", UseDescriptionForTitle = true }; if (Directory.Exists(folder.Text)) dialog.SelectedPath = folder.Text; if (dialog.ShowDialog(this) == DialogResult.OK) folder.Text = dialog.SelectedPath; };
+        openHistory.Click += async (_, _) => await RunActionAsync(() =>
+        {
+            ValidateFolder();
+            string path = Path.Combine(Path.GetFullPath(folder.Text.Trim()), FolderStore.MetadataName, "history");
+            FolderStore.EnsureNoLinks(path);
+            if (!Directory.Exists(path)) throw new IOException("Start the server once to create file history.");
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
+            return Task.CompletedTask;
+        });
         search.Click += async (_, _) => await SearchAsync();
         servers.SelectedIndexChanged += (_, _) => { if (servers.SelectedItem is DiscoveredServer s) { address.Text = s.Address; port.Value = s.Info.Port; } };
         start.Click += async (_, _) => await RunActionAsync(StartAsync);
@@ -212,6 +222,7 @@ public sealed class MainForm : Form
         {
             if (preview) return;
             if (IsServer && settings.StartServerAtLogin) await RunActionAsync(StartAsync);
+            else if (!IsServer && settings.Binding is not null) await RunActionAsync(StartAsync);
             else if (!IsServer) await SearchAsync();
         };
     }
@@ -277,12 +288,13 @@ public sealed class MainForm : Form
         start.Enabled = !Running && !busy && (IsServer || settings.Binding is not null);
         stop.Enabled = Running && !busy;
         startAtLogin.Enabled = !busy;
+        openHistory.Enabled = !busy;
         pair.Enabled = search.Enabled = address.Enabled = port.Enabled = pairCode.Enabled = servers.Enabled = !Running && !busy;
         rotate.Enabled = revoke.Enabled = server is not null && !busy;
         status.Text = busy ? "Working…" : server is not null ? "Server running" : client is not null ? "Sync active · see activity" : "Stopped";
         UpdateTrayActivity();
         UpdateTrayServerMenu();
-        paired.Text = settings.Binding is { } b ? $"Remembered server: {b.Address}:{b.Port} · Start sync to reconnect without a code." : "Not paired yet. Choose a local folder and pair once.";
+        paired.Text = settings.Binding is { } b ? $"Remembered server: {b.Address}:{b.Port} · Sync resumes automatically when this client opens." : "Not paired yet. Choose a local folder and pair once.";
         UpdateCode();
     }
     private void UpdateCode()

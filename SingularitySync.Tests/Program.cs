@@ -64,6 +64,74 @@ async Task CheckSingleInstance(bool crash)
 }
 try
 {
+    // Simulate a lost first packet and an unrelated UDP payload before a valid reply.
+    using (var discoveryStop = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+    using (var responder = new UdpClient(new IPEndPoint(IPAddress.Loopback, Protocol.DiscoveryPort)))
+    {
+        var advertised = new ServerInfo(Guid.NewGuid().ToString("N"), "Retry test", [], 45831, Guid.NewGuid().ToString("N"));
+        var replies = Task.Run(async () =>
+        {
+            await responder.ReceiveAsync(discoveryStop.Token);
+            var packet = await responder.ReceiveAsync(discoveryStop.Token);
+            await responder.SendAsync("invalid json"u8.ToArray(), packet.RemoteEndPoint, discoveryStop.Token);
+            byte[] payload = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(advertised, Protocol.Json);
+            await responder.SendAsync(payload, packet.RemoteEndPoint, discoveryStop.Token);
+            await responder.SendAsync(payload, packet.RemoteEndPoint, discoveryStop.Token);
+        });
+        var found = await Discovery.FindAsync(TimeSpan.FromSeconds(1.5));
+        await replies;
+        Assert(found.Count(s => s.Info.Id == advertised.Id) == 1, "discovery retries lost probes, ignores malformed replies, and deduplicates servers");
+    }
+    using (var cancelled = new CancellationTokenSource())
+    {
+        cancelled.Cancel();
+        try { await Discovery.FindAsync(TimeSpan.FromSeconds(1), cancelled.Token); throw new Exception("Discovery ignored cancellation"); }
+        catch (OperationCanceledException) { Pass("discovery propagates caller cancellation"); }
+    }
+    Assert((await Discovery.FindAsync(TimeSpan.FromMilliseconds(50))).Count == 0, "discovery timeout without responders returns an empty list");
+    string hf = Folder("history-unit");
+    string nested = Path.Combine(hf, "nested");
+    Directory.CreateDirectory(nested);
+    string tracked = Path.Combine(nested, "document.txt");
+    string historyRoot = Path.Combine(hf, FolderStore.MetadataName, "history");
+    using (var historyStore = new FolderStore(hf))
+    {
+        var history = new FileHistory(historyStore);
+        for (int i = 0; i < 12; i++)
+        {
+            File.WriteAllText(tracked, "version " + i);
+            historyStore.Invalidate();
+            history.Capture(historyStore.Scan()["nested/document.txt"]);
+        }
+        var snapshots = Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories);
+        Assert(snapshots.Length == 10 && snapshots.Select(File.ReadAllText).ToHashSet().SetEquals(Enumerable.Range(2, 10).Select(i => "version " + i)), "history retains exactly the ten newest contents");
+        history.Capture(historyStore.Scan()["nested/document.txt"]);
+        Assert(Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories).Length == 10, "unchanged scan does not duplicate history");
+        File.WriteAllText(tracked, "pending version");
+        historyStore.Invalidate();
+        var stale = historyStore.Scan()["nested/document.txt"];
+        File.WriteAllText(tracked, "changed during capture");
+        await Throws(() => { history.Capture(stale); return Task.CompletedTask; }, "changing file cannot commit an unverified snapshot");
+        Assert(Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories).Length == 10, "failed capture preserves previous history");
+        Assert(historyStore.Scan().Count == 1, "history excluded from file scan");
+        string oldest = snapshots.Single(p => File.ReadAllText(p) == "version 2");
+        using (var locked = new FileStream(oldest, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            historyStore.Invalidate();
+            await Throws(() => { history.Capture(historyStore.Scan()["nested/document.txt"]); return Task.CompletedTask; }, "locked oldest snapshot defers pruning");
+            Assert(File.ReadAllText(oldest) == "version 2" && Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "changed during capture"), "failed prune retains old copy and committed new snapshot");
+        }
+        history.Capture(historyStore.Scan()["nested/document.txt"]);
+        Assert(Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories).Length == 10, "next scan retries interrupted pruning without a duplicate snapshot");
+    }
+    using (var historyStore = new FolderStore(hf))
+    {
+        var history = new FileHistory(historyStore);
+        history.Capture(historyStore.Scan()["nested/document.txt"]);
+        Assert(Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories).Length == 10, "history retention survives restart");
+        File.Delete(tracked);
+        Assert(historyStore.Scan().Count == 0 && Directory.GetFiles(historyRoot, "document.txt", SearchOption.AllDirectories).Length == 10, "deletion retains saved snapshots");
+    }
     var clock = new TestClock();
     var telemetry = new SyncActivity(clock);
     using (telemetry.Begin("peer", "Office PC", "192.0.2.1", true))
@@ -105,6 +173,8 @@ try
     await client1.EnsureConnectedAsync(CancellationToken.None);
     await client1.SyncOnceAsync(); await client2.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(cf1, "hello.txt")) == "server original" && File.ReadAllText(Path.Combine(sf, "local.txt")) == "client original" && File.Exists(Path.Combine(cf2, "local.txt")), "initial two-way merge and fan-out");
+    Assert(Directory.GetFiles(Path.Combine(sf, FolderStore.MetadataName, "history"), "hello.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "server original"), "server seeds existing files into history");
+    Assert(!Directory.Exists(Path.Combine(cf1, FolderStore.MetadataName, "history")) && !Directory.Exists(Path.Combine(cf2, FolderStore.MetadataName, "history")), "clients neither create nor receive history");
     var initialServer = server.Activity.Snapshot();
     var initialClient1 = client1.Activity.Snapshot();
     var initialClient2 = client2.Activity.Snapshot();
@@ -122,10 +192,12 @@ try
     File.WriteAllText(Path.Combine(sf, "hello.txt"), "server edited");
     await client1.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(cf1, "hello.txt")) == "server edited", "server edits reach client");
+    Assert(Directory.GetFiles(Path.Combine(sf, FolderStore.MetadataName, "history"), "hello.txt", SearchOption.AllDirectories).Select(File.ReadAllText).ToHashSet().SetEquals(["server original", "server edited"]), "direct server edits preserve both observed versions");
+    Assert(Directory.GetFiles(Path.Combine(cf1, FolderStore.MetadataName, "recovery"), "hello.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "server original"), "client recovery behavior is unchanged");
     File.WriteAllText(Path.Combine(cf1, "local.txt"), "client edited");
     await client1.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(sf, "local.txt")) == "client edited", "client edits reach server");
-    Assert(Directory.EnumerateFiles(Path.Combine(sf, ".singularity-sync", "recovery"), "local.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "client original"), "server retains overwritten version");
+    Assert(Directory.EnumerateFiles(Path.Combine(sf, ".singularity-sync", "history"), "local.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "client original"), "server retains overwritten version");
     File.WriteAllText(Path.Combine(sf, "hello.txt"), "server conflict winner");
     File.WriteAllText(Path.Combine(cf1, "hello.txt"), "offline client edit");
     await client1.SyncOnceAsync();
@@ -133,6 +205,8 @@ try
     File.Delete(Path.Combine(cf1, "hello.txt"));
     await client1.SyncOnceAsync(); await client2.SyncOnceAsync();
     Assert(!File.Exists(Path.Combine(sf, "hello.txt")) && !File.Exists(Path.Combine(cf2, "hello.txt")), "client deletion propagates to server and peers");
+    Assert(Directory.GetFiles(Path.Combine(sf, FolderStore.MetadataName, "history"), "hello.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "server conflict winner"), "client deletion retains final server snapshot");
+    Assert(!Directory.Exists(Path.Combine(sf, FolderStore.MetadataName, "recovery")), "server does not accumulate duplicate unlimited recovery copies");
     File.Delete(Path.Combine(sf, "local.txt"));
     File.WriteAllText(Path.Combine(cf1, "local.txt"), "offline versus deletion");
     await client1.SyncOnceAsync();
@@ -234,6 +308,7 @@ try
     server = new(sf, settings, port: port, saveSettings: () => DiskJson.Write(settingsPath, settings)); await server.StartAsync();
     client1 = new(cf1, b1); await client1.EnsureConnectedAsync(CancellationToken.None); await client1.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(sf, "offline.txt")) == "written while offline", "restart preserves identity, authorization, and offline baseline");
+    Assert(Directory.GetFiles(Path.Combine(sf, FolderStore.MetadataName, "history"), "hello.txt", SearchOption.AllDirectories).Any(p => File.ReadAllText(p) == "server original"), "deleted file history survives server restart");
     client1.Start();
     var timer = Stopwatch.StartNew();
     File.WriteAllText(Path.Combine(sf, "watch-server.txt"), "watcher push");
