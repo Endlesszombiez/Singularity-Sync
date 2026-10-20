@@ -7,6 +7,7 @@ public sealed class FileHistory
 {
     public const int Limit = 10;
     private readonly FolderStore store;
+    private readonly Dictionary<string, (string Hash, string Snapshot)> captured = new(StringComparer.OrdinalIgnoreCase);
     public string Root { get; }
     public FileHistory(FolderStore store)
     {
@@ -20,6 +21,9 @@ public sealed class FileHistory
     {
         store.Resolve(entry.Path);
         if (entry.Deleted) return;
+        if (captured.TryGetValue(entry.Path, out var cached) && cached.Hash == entry.Hash && File.Exists(cached.Snapshot)) return;
+        // Invalidate before work so a failed capture/prune is retried next time.
+        captured.Remove(entry.Path);
         string key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(entry.Path.ToUpperInvariant())));
         string directory = Path.Combine(Root, key);
         FolderStore.EnsureNoLinks(directory);
@@ -66,6 +70,7 @@ public sealed class FileHistory
             if (File.Exists(snapshot)) File.Delete(snapshot);
             Directory.Delete(candidate, false);
         }
+        captured[entry.Path] = (entry.Hash!, SnapshotPath(directory, index.Path, index.Versions[^1].Id));
     }
 
     private static bool IsId(string id) => id.Length == 55 && id[8] == '-' && id[22] == '-' &&

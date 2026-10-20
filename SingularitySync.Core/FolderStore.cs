@@ -16,6 +16,7 @@ public sealed class FolderStore : IDisposable
         Root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         if (!Directory.Exists(Root)) throw new IOException("The sync folder does not exist.");
         EnsureNoLinks(Root);
+        EnsureNotDirectAccess(Root);
         Metadata = Path.Combine(Root, MetadataName);
         EnsureNoLinks(Metadata);
         Directory.CreateDirectory(Metadata);
@@ -41,7 +42,14 @@ public sealed class FolderStore : IDisposable
         string full = Path.GetFullPath(Path.Combine(Root, Path.Combine(parts)));
         if (!full.StartsWith(Root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new IOException("Path escapes sync folder.");
         EnsureNoLinks(full);
+        EnsureNotDirectAccess(Path.GetDirectoryName(full)!);
         return full;
+    }
+    public static void EnsureNotDirectAccess(string path)
+    {
+        for (string? current = path; current is not null; current = Path.GetDirectoryName(current))
+            if (File.Exists(Path.Combine(current, ".singularity-smb")))
+                throw new IOException("This folder is reserved for direct SMB access. Live server files cannot be synchronized.");
     }
     public static void EnsureNoLinks(string path)
     {
@@ -55,11 +63,50 @@ public sealed class FolderStore : IDisposable
             catch (DirectoryNotFoundException) { }
         }
     }
-    public void Invalidate() { lock (cacheLock) cache.Clear(); }
+    public void Invalidate(string? relative = null, bool descendants = true)
+    {
+        lock (cacheLock)
+        {
+            if (relative is null) { cache.Clear(); return; }
+            cache.Remove(relative);
+            if (!descendants) return;
+            // Directory renames/deletions also invalidate their descendants.
+            foreach (string key in cache.Keys.Where(p => p.StartsWith(relative + "/", StringComparison.OrdinalIgnoreCase)).ToArray()) cache.Remove(key);
+        }
+    }
+    public void InvalidateChange(FileSystemEventArgs change)
+    {
+        Invalidate(Path.GetRelativePath(Root, change.FullPath).Replace('\\', '/'), descendants: change.ChangeType != WatcherChangeTypes.Changed &&
+            (change.ChangeType != WatcherChangeTypes.Created || Directory.Exists(change.FullPath)));
+        if (change is RenamedEventArgs renamed) Invalidate(Path.GetRelativePath(Root, renamed.OldFullPath).Replace('\\', '/'));
+    }
+    // Transfer preconditions always rehash the target, independently of watcher delivery.
+    public FileEntry? ReadEntry(string relative, bool forceHash = false)
+    {
+        if (!Directory.Exists(Root)) throw new IOException("Sync folder unavailable; deletions have been paused.");
+        string full = Resolve(relative);
+        lock (cacheLock)
+        {
+            var info = new FileInfo(full);
+            if (!info.Exists) { cache.Remove(relative); return null; }
+            long length = info.Length, ticks = info.LastWriteTimeUtc.Ticks;
+            if (forceHash || !cache.TryGetValue(relative, out var cached) || cached.Length != length || cached.Ticks != ticks)
+            {
+                using var stream = OpenRead(relative);
+                string hash = Hash(stream);
+                info.Refresh();
+                if (!info.Exists || info.Length != length || info.LastWriteTimeUtc.Ticks != ticks) throw new IOException("File is still changing: " + relative);
+                cache[relative] = (length, ticks, hash);
+            }
+            var value = cache[relative];
+            return new(relative, value.Hash, value.Length, "");
+        }
+    }
     public Dictionary<string, FileEntry> Scan()
     {
         if (!Directory.Exists(Root)) throw new IOException("Sync folder unavailable; deletions have been paused.");
         EnsureNoLinks(Root);
+        EnsureNotDirectAccess(Root);
         lock (cacheLock)
         {
             if (DateTime.UtcNow - lastFullScan > TimeSpan.FromSeconds(60)) { cache.Clear(); lastFullScan = DateTime.UtcNow; }
@@ -71,6 +118,7 @@ public sealed class FolderStore : IDisposable
     }
     private void Walk(string dir, Dictionary<string, FileEntry> result)
     {
+        EnsureNotDirectAccess(dir);
         foreach (string path in Directory.EnumerateFileSystemEntries(dir))
         {
             if (Path.GetFileName(path).Equals(MetadataName, StringComparison.OrdinalIgnoreCase)) continue;
@@ -78,19 +126,8 @@ public sealed class FolderStore : IDisposable
             if ((attributes & FileAttributes.ReparsePoint) != 0) throw new IOException("Remove the symlink/junction from the sync folder: " + path);
             if ((attributes & FileAttributes.Directory) != 0) { Walk(path, result); continue; }
             string relative = Path.GetRelativePath(Root, path).Replace('\\', '/');
-            Resolve(relative);
-            var info = new FileInfo(path);
-            long length = info.Length, ticks = info.LastWriteTimeUtc.Ticks;
-            if (!cache.TryGetValue(relative, out var cached) || cached.Length != length || cached.Ticks != ticks)
-            {
-                using var stream = OpenRead(relative);
-                string hash = Hash(stream);
-                info.Refresh();
-                if (info.Length != length || info.LastWriteTimeUtc.Ticks != ticks) throw new IOException("File is still changing: " + relative);
-                cached = (length, ticks, hash);
-                cache[relative] = cached;
-            }
-            result.Add(relative, new(relative, cached.Hash, cached.Length, ""));
+            var entry = ReadEntry(relative) ?? throw new IOException("File disappeared during scan: " + relative);
+            result.Add(relative, entry);
         }
     }
     public FileStream OpenRead(string path) => new(Resolve(path), FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.SequentialScan);
@@ -149,7 +186,7 @@ public sealed class FolderStore : IDisposable
                 catch (UnauthorizedAccessException) { break; }
             }
         }
-        Invalidate();
+        Invalidate(relative, descendants: false);
     }
     public string PreserveConflict(string relative, string expectedHash)
     {

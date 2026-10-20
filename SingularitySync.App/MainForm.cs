@@ -8,6 +8,8 @@ namespace SingularitySync.App;
 public sealed class MainForm : Form
 {
     private readonly Settings settings;
+    private readonly SmbPreferences smbPreferences;
+    private readonly SmbPanel smbPanel;
     private readonly Icon applicationIcon;
     private readonly ComboBox mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
     private readonly TextBox folder = new() { Dock = DockStyle.Fill, PlaceholderText = "Choose a folder on this computer" };
@@ -47,6 +49,7 @@ public sealed class MainForm : Form
     public MainForm(bool preview = false, bool previewClient = false)
     {
         settings = preview ? new Settings() : Settings.Load();
+        smbPreferences = preview ? new SmbPreferences() : SmbPreferences.Load();
         using (var iconStream = typeof(MainForm).Assembly.GetManifestResourceStream("SingularitySync.AppIcon")
             ?? throw new InvalidOperationException("Application icon is missing."))
             applicationIcon = new Icon(iconStream);
@@ -56,7 +59,7 @@ public sealed class MainForm : Form
         BackColor = Color.FromArgb(245, 247, 251);
         ForeColor = Color.FromArgb(24, 35, 52);
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new(800, 710); MinimumSize = new(740, 680); StartPosition = FormStartPosition.CenterScreen;
+        ClientSize = new(840, 900); MinimumSize = new(740, 680); StartPosition = FormStartPosition.CenterScreen;
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new(24), ColumnCount = 1, RowCount = 4 };
         layout.RowStyles.Add(new(SizeType.Absolute, 76));
         layout.RowStyles.Add(new(SizeType.Percent, 100));
@@ -67,9 +70,23 @@ public sealed class MainForm : Form
         heading.Controls.Add(new Label { Text = "One shared folder, across your LAN.", AutoSize = true, ForeColor = Color.FromArgb(85, 100, 120), Margin = new(0, 4, 0, 0) });
         layout.Controls.Add(heading, 0, 0);
         var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new(18, 8) };
-        var setup = new TabPage("Setup") { BackColor = Color.White, Padding = new(20), AutoScroll = true };
+        var setup = new TabPage("File sync") { BackColor = Color.White, Padding = new(20), AutoScroll = true };
         var logs = new TabPage("Activity") { BackColor = Color.White, Padding = new(16) };
-        logs.Controls.Add(activity); tabs.TabPages.AddRange([setup, logs]);
+        var direct = new TabPage("Direct access (SMB)") { BackColor = Color.White, Padding = new(6) };
+        smbPanel = new SmbPanel(smbPreferences, async enabled =>
+        {
+            if (busy) throw new IOException("Wait for the current sync operation to finish.");
+            if (enabled) await RunActionAsync(StopAsync);
+            if (Running) throw new IOException("Stop synchronization before enabling direct access.");
+            bool previous = smbPreferences.Enabled;
+            smbPreferences.Enabled = enabled;
+            try { smbPreferences.Save(); }
+            catch { smbPreferences.Enabled = previous; throw; }
+            UpdateUi();
+        }, preview);
+        direct.Controls.Add(smbPanel);
+        logs.Controls.Add(activity); tabs.TabPages.AddRange([direct, setup, logs]);
+        tabs.SelectedTab = smbPreferences.Enabled || string.IsNullOrWhiteSpace(settings.Folder) ? direct : setup;
         var content = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1, RowCount = 6 };
         foreach (int height in new[] { 30, 44, 30, 48, 1, 280 }) content.RowStyles.Add(new(SizeType.Absolute, height));
         mode.Items.AddRange(["Server", "Client"]); mode.SelectedIndex = preview ? (previewClient ? 1 : 0) : (settings.Mode == "Client" ? 1 : 0);
@@ -109,8 +126,16 @@ public sealed class MainForm : Form
         clientContent.Controls.Add(fields, 0, 3); paired.MaximumSize = new(620, 0); clientContent.Controls.Add(paired, 0, 4);
         clientPanel.Controls.Add(clientContent); content.Controls.Add(modePanel, 0, 5);
         setup.Controls.Add(content); layout.Controls.Add(tabs, 0, 1);
-        layout.Controls.Add(Row(start, stop, status), 0, 2);
-        layout.Controls.Add(new Label { Text = "Closing this window keeps sync in the tray.  ·  Trusted LAN / unencrypted", Dock = DockStyle.Fill, Font = new("Segoe UI", 9), ForeColor = Color.FromArgb(85, 100, 120) }, 0, 3);
+        var syncActions = Row(start, stop, status);
+        layout.Controls.Add(syncActions, 0, 2);
+        void UpdateSelectedTab()
+        {
+            syncActions.Visible = tabs.SelectedTab == setup;
+            layout.RowStyles[2].Height = tabs.SelectedTab == setup ? 54 : 0;
+        }
+        tabs.SelectedIndexChanged += (_, _) => UpdateSelectedTab();
+        UpdateSelectedTab();
+        layout.Controls.Add(new Label { Text = "SMB: encrypted direct access  ·  File sync: trusted LAN / unencrypted", Dock = DockStyle.Fill, Font = new("Segoe UI", 9), ForeColor = Color.FromArgb(85, 100, 120) }, 0, 3);
         Controls.Add(layout);
         trayActivity = new TrayActivityPanel(RestoreFromTray);
         trayPopup.Items.Add(new ToolStripControlHost(trayActivity) { Margin = Padding.Empty, Padding = Padding.Empty, AutoSize = false, Size = trayActivity.Size });
@@ -221,6 +246,7 @@ public sealed class MainForm : Form
         Shown += async (_, _) =>
         {
             if (preview) return;
+            if (smbPreferences.Enabled) { await smbPanel.RestoreConnectionAsync(); return; }
             if (IsServer && settings.StartServerAtLogin) await RunActionAsync(StartAsync);
             else if (!IsServer && settings.Binding is not null) await RunActionAsync(StartAsync);
             else if (!IsServer) await SearchAsync();
@@ -256,6 +282,7 @@ public sealed class MainForm : Form
     internal async Task ExitAsync()
     {
         if (closing) return;
+        if (smbPanel.Busy) { MessageBox.Show(this, "Wait for the SMB operation to finish before exiting."); return; }
         exitRequested = true;
         if (busy) return; // Finish pairing/start/stop before disposing its resources.
         busy = true; UpdateUi();
@@ -276,7 +303,7 @@ public sealed class MainForm : Form
     }
     private void UpdateTrayServerMenu()
     {
-        trayServerToggle.Visible = IsServer && !string.IsNullOrWhiteSpace(folder.Text);
+        trayServerToggle.Visible = !smbPreferences.Enabled && IsServer && !string.IsNullOrWhiteSpace(folder.Text);
         trayServerToggle.Text = server is null ? "Start server" : "Stop server";
         trayServerToggle.Enabled = !busy && !closing && !exitRequested;
     }
@@ -287,7 +314,7 @@ public sealed class MainForm : Form
         start.Text = IsServer ? "Start server" : "Start sync";
         start.Enabled = !Running && !busy && (IsServer || settings.Binding is not null);
         stop.Enabled = Running && !busy;
-        startAtLogin.Enabled = !busy;
+        startAtLogin.Enabled = !busy && !smbPreferences.Enabled;
         openHistory.Enabled = !busy;
         pair.Enabled = search.Enabled = address.Enabled = port.Enabled = pairCode.Enabled = servers.Enabled = !Running && !busy;
         rotate.Enabled = revoke.Enabled = server is not null && !busy;
@@ -295,6 +322,11 @@ public sealed class MainForm : Form
         UpdateTrayActivity();
         UpdateTrayServerMenu();
         paired.Text = settings.Binding is { } b ? $"Remembered server: {b.Address}:{b.Port} · Sync resumes automatically when this client opens." : "Not paired yet. Choose a local folder and pair once.";
+        if (smbPreferences.Enabled)
+        {
+            start.Enabled = pair.Enabled = mode.Enabled = folder.Enabled = browse.Enabled = false;
+            status.Text = "Direct access mode · manage in SMB tab";
+        }
         UpdateCode();
     }
     private void UpdateCode()
@@ -323,6 +355,7 @@ public sealed class MainForm : Form
     }
     private async Task StartAsync()
     {
+        if (smbPreferences.Enabled) throw new IOException("File sync is disabled while direct access mode is enabled.");
         ValidateFolder();
         networkActivity.ClearPeers();
         settings.Mode = IsServer ? "Server" : "Client"; settings.Folder = Path.GetFullPath(folder.Text.Trim()); settings.Save();

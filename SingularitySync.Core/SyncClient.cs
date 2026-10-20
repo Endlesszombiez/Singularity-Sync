@@ -14,6 +14,7 @@ public sealed class SyncClient : IAsyncDisposable
     private readonly CancellationTokenSource stop = new();
     private readonly FileSystemWatcher watcher;
     private ClientState state;
+    private readonly StateJournal<Baseline> journal;
     private Task? runner;
     private long sequence;
     public Binding Binding { get; private set; }
@@ -31,10 +32,13 @@ public sealed class SyncClient : IAsyncDisposable
             if (state.ServerId != binding.ServerId || state.FolderId != binding.FolderId)
                 throw new IOException("This folder belongs to a different sync pairing. Choose a new client folder.");
             state.Files = new(state.Files, StringComparer.OrdinalIgnoreCase);
+            journal = new(store.Metadata, "client-journal");
+            foreach (var entry in journal.ReadAll()) state.Files[entry.Path] = entry;
             DiskJson.Write(StatePath, state);
+            journal.Checkpoint(StatePath, state, force: true);
             watcher = new(store.Root) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size };
             watcher.Changed += OnChange; watcher.Created += OnChange; watcher.Deleted += OnChange; watcher.Renamed += OnChange;
-            watcher.Error += (_, _) => Wake(); watcher.EnableRaisingEvents = true;
+            watcher.Error += (_, _) => { store.Invalidate(); Wake(); }; watcher.EnableRaisingEvents = true;
         }
         catch { store.Dispose(); http.Dispose(); throw; }
     }
@@ -110,7 +114,7 @@ public sealed class SyncClient : IAsyncDisposable
     private void Wake() { try { wake.Release(); } catch (SemaphoreFullException) { } }
     private void OnChange(object sender, FileSystemEventArgs e)
     {
-        if (!e.FullPath.StartsWith(store.Metadata + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) { store.Invalidate(); Wake(); }
+        if (!e.FullPath.StartsWith(store.Metadata + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) { store.InvalidateChange(e); Wake(); }
     }
     private async Task RunAsync()
     {
@@ -188,14 +192,19 @@ public sealed class SyncClient : IAsyncDisposable
             sequence = manifest.Sequence;
         }
         catch (HttpRequestException) { Activity.Offline(Binding.ServerId); throw; }
-        finally { cycle.Release(); }
+        finally
+        {
+            try { journal.Checkpoint(StatePath, state, force: true); }
+            finally { cycle.Release(); }
+        }
     }
     private void Remember(string path, FileEntry? entry)
     {
         var baseline = new Baseline(path, entry?.Hash, entry?.Version ?? "missing");
         if (state.Files.GetValueOrDefault(path) == baseline) return;
+        journal.Write(path, baseline);
         state.Files[path] = baseline;
-        DiskJson.Write(StatePath, state);
+        journal.Checkpoint(StatePath, state);
     }
     private async Task<FileEntry?> UploadAsync(string path, string? hash, string? expectedVersion, CancellationToken ct)
     {

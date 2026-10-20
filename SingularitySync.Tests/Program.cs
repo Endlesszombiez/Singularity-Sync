@@ -25,7 +25,7 @@ void Pass(string label) { passed++; Console.WriteLine("PASS " + label); }
 void Assert(bool condition, string label) { if (!condition) throw new Exception("FAIL " + label); Pass(label); }
 async Task Throws(Func<Task> action, string label)
 {
-    try { await action(); } catch (Exception e) when (e is IOException or HttpRequestException) { Pass(label); return; }
+    try { await action(); } catch (Exception e) when (e is IOException or HttpRequestException or UnauthorizedAccessException) { Pass(label); return; }
     throw new Exception("FAIL " + label + " (no exception)");
 }
 int FreePort()
@@ -64,6 +64,50 @@ async Task CheckSingleInstance(bool crash)
 }
 try
 {
+    Assert(SmbConnection.Remote("OFFICE-PC", "CrossLink") == @"\\OFFICE-PC\CrossLink", "SMB builds a UNC path");
+    foreach (var bad in new[] { @"\\server", "server/share", "server:445", "host;whoami", "..", "" })
+    {
+        try { SmbConnection.Remote(bad, "CrossLink"); throw new Exception("Accepted invalid SMB host"); }
+        catch (ArgumentException) { Pass("SMB rejects invalid host " + bad); }
+    }
+    foreach (var bad in new[] { "../data", "C$", "share/name", "share'", "" })
+    {
+        try { SmbConnection.Remote("server", bad); throw new Exception("Accepted invalid share"); }
+        catch (ArgumentException) { Pass("SMB rejects invalid share " + bad); }
+    }
+    Assert(SmbConnection.Remote("server", "IPC$", allowAdministrative: true) == @"\\server\IPC$", "SMB can address an IPC session for targeted disconnect");
+    Assert(SmbConnection.ValidateDrive(" x: ") == "X:" && SmbConnection.ValidateDrive("") == "", "SMB normalizes optional drive");
+    try { SmbConnection.ValidateDrive("C:"); throw new Exception("Accepted system drive"); }
+    catch (ArgumentException) { Pass("SMB rejects system drive"); }
+    string directRoot = Folder("direct-access");
+    File.WriteAllText(Path.Combine(directRoot, ".singularity-smb"), "reserved");
+    await Throws(() => { using var blocked = new FolderStore(directRoot); return Task.CompletedTask; }, "SMB root cannot become a sync folder");
+    string directChild = Path.Combine(directRoot, "nested"); Directory.CreateDirectory(directChild);
+    await Throws(() => { using var blocked = new FolderStore(directChild); return Task.CompletedTask; }, "SMB descendants cannot become sync folders");
+    string directParent = Folder("direct-parent");
+    using (var parentStore = new FolderStore(directParent))
+    {
+        string nestedDirect = Path.Combine(directParent, "database"); Directory.CreateDirectory(nestedDirect);
+        File.WriteAllText(Path.Combine(nestedDirect, ".singularity-smb"), "reserved");
+        await Throws(() => { parentStore.Scan(); return Task.CompletedTask; }, "sync scan refuses nested direct-access data");
+        await Throws(() => { parentStore.Resolve("database/tax.db"); return Task.CompletedTask; }, "sync writes refuse nested direct-access data");
+    }
+    if (OperatingSystem.IsWindows())
+    {
+        string credentialHost = "test-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            Assert(SmbConnection.ReadCredential(credentialHost) is null, "SMB missing credential returns no secret");
+            SmbConnection.SaveCredential(credentialHost, @"SERVER\TestAccount", "Aa9!temporary-test-密碼");
+            var savedCredential = SmbConnection.ReadCredential(credentialHost);
+            Assert(savedCredential?.User == @"SERVER\TestAccount" && savedCredential?.Password == "Aa9!temporary-test-密碼", "Windows Credential Manager Unicode round trip");
+            SmbConnection.ForgetCredential(credentialHost);
+            Assert(SmbConnection.ReadCredential(credentialHost) is null, "SMB credential removal");
+        }
+        finally { SmbConnection.ForgetCredential(credentialHost); }
+        string probe = Folder("smb-probe");
+        Assert(SmbConnection.Probe(probe).Contains("passed") && !Directory.EnumerateFileSystemEntries(probe).Any(), "access probe checks IO and exclusive open, cleans temporary file");
+    }
     // Simulate a lost first packet and an unrelated UDP payload before a valid reply.
     using (var discoveryStop = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
     using (var responder = new UdpClient(new IPEndPoint(IPAddress.Loopback, Protocol.DiscoveryPort)))
@@ -89,6 +133,67 @@ try
         catch (OperationCanceledException) { Pass("discovery propagates caller cancellation"); }
     }
     Assert((await Discovery.FindAsync(TimeSpan.FromMilliseconds(50))).Count == 0, "discovery timeout without responders returns an empty list");
+    using (var cacheStore = new FolderStore(Folder("incremental-cache")))
+    {
+        File.WriteAllText(cacheStore.Resolve("stable.txt"), "stable");
+        File.WriteAllText(cacheStore.Resolve("changed.txt"), "before");
+        var initial = cacheStore.Scan();
+        using (var locked = new FileStream(cacheStore.Resolve("stable.txt"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+        {
+            File.WriteAllText(cacheStore.Resolve("changed.txt"), "after!");
+            cacheStore.Invalidate("changed.txt");
+            var updated = cacheStore.Scan();
+            Assert(updated["stable.txt"].Hash == initial["stable.txt"].Hash && updated["changed.txt"].Hash != initial["changed.txt"].Hash,
+                "target invalidation does not reread unrelated files");
+        }
+        string target = cacheStore.Resolve("changed.txt");
+        var timestamp = File.GetLastWriteTimeUtc(target);
+        var before = cacheStore.ReadEntry("changed.txt")!;
+        File.WriteAllText(target, "silent"); File.SetLastWriteTimeUtc(target, timestamp);
+        Assert(cacheStore.ReadEntry("changed.txt", forceHash: true)!.Hash != before.Hash,
+            "transfer verification detects edits with unchanged size and timestamp");
+        Directory.CreateDirectory(Path.Combine(cacheStore.Root, "nested"));
+        string nestedCacheFile = Path.Combine(cacheStore.Root, "nested", "file.txt");
+        File.WriteAllText(nestedCacheFile, "before");
+        var nestedBefore = cacheStore.Scan()["nested/file.txt"];
+        timestamp = File.GetLastWriteTimeUtc(nestedCacheFile);
+        File.WriteAllText(nestedCacheFile, "after!"); File.SetLastWriteTimeUtc(nestedCacheFile, timestamp);
+        cacheStore.InvalidateChange(new RenamedEventArgs(WatcherChangeTypes.Renamed, cacheStore.Root, "nested", "previous"));
+        Assert(cacheStore.Scan()["nested/file.txt"].Hash != nestedBefore.Hash, "directory events invalidate descendant hashes");
+    }
+    using (var journalStore = new FolderStore(Folder("journal-unit")))
+    {
+        string checkpoint = Path.Combine(journalStore.Metadata, "client-state.json");
+        var baselineState = new ClientState();
+        DiskJson.Write(checkpoint, baselineState);
+        var journal = new StateJournal<Baseline>(journalStore.Metadata, "client-journal");
+        var old = new Baseline("one.txt", "old", "1");
+        var latest = new Baseline("one.txt", "latest", "2");
+        var deleted = new Baseline("two.txt", null, "3");
+        journal.Write(old.Path, old); journal.Write(latest.Path, latest); journal.Write(deleted.Path, deleted);
+        // Reopen without checkpointing, as after a terminated process.
+        journal = new(journalStore.Metadata, "client-journal");
+        foreach (var record in journal.ReadAll()) baselineState.Files[record.Path] = record;
+        Assert(baselineState.Files[latest.Path] == latest && baselineState.Files[deleted.Path] == deleted,
+            "journal replay recovers latest per-file progress and deletions before checkpoint");
+        // A crash after snapshot replacement but before journal cleanup leaves both.
+        DiskJson.Write(checkpoint, baselineState);
+        var reopened = DiskJson.Read<ClientState>(checkpoint)!;
+        foreach (var record in journal.ReadAll()) reopened.Files[record.Path] = record;
+        Assert(reopened.Files[latest.Path] == latest && reopened.Files.Count == 2, "checkpoint plus leftover journal replays idempotently");
+        journal.Checkpoint(checkpoint, reopened, force: true);
+        Assert(!journal.ReadAll().Any() && DiskJson.Read<ClientState>(checkpoint)!.Files.Count == 2, "checkpoint retains progress before clearing journal");
+        journal.Write(latest.Path, latest);
+        using (var blockedCheckpoint = new FileStream(checkpoint, FileMode.Open, FileAccess.Read, FileShare.Read))
+            await Throws(() => { journal.Checkpoint(checkpoint, reopened, force: true); return Task.CompletedTask; }, "failed checkpoint replacement leaves journal recoverable");
+        Assert(journal.ReadAll().Single() == latest, "journal progress survives checkpoint write failure");
+        string recordPath = Directory.GetFiles(Path.Combine(journalStore.Metadata, "client-journal"), "*.json").Single();
+        using (var blockedCleanup = new FileStream(recordPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            await Throws(() => { journal.Checkpoint(checkpoint, reopened, force: true); return Task.CompletedTask; }, "interrupted journal cleanup preserves the committed checkpoint");
+        Assert(DiskJson.Read<ClientState>(checkpoint)!.Files[latest.Path] == latest && journal.ReadAll().Single() == latest,
+            "checkpoint and remaining record agree after cleanup failure");
+        journal.Checkpoint(checkpoint, reopened, force: true);
+    }
     string hf = Folder("history-unit");
     string nested = Path.Combine(hf, "nested");
     Directory.CreateDirectory(nested);
@@ -232,6 +337,16 @@ try
     File.WriteAllText(Path.Combine(cf1, "shape", "child.txt"), "now nested again");
     await client1.SyncOnceAsync();
     Assert(File.ReadAllText(Path.Combine(sf, "shape", "child.txt")) == "now nested again", "file replaced by a directory");
+    using (var unrelatedLock = new FileStream(Path.Combine(sf, "renamed.txt"), FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+    using (var targeted = new HttpRequestMessage(HttpMethod.Put, "/file?path=target-only.txt"))
+    {
+        targeted.Headers.Add("X-Expected-Version", "missing");
+        targeted.Headers.Add("X-Content-SHA256", Convert.ToHexString(SHA256.HashData("targeted upload"u8)));
+        targeted.Content = new StringContent("targeted upload");
+        using var result = await http.SendAsync(targeted);
+        Assert(result.IsSuccessStatusCode && File.ReadAllText(Path.Combine(sf, "target-only.txt")) == "targeted upload",
+            "upload completes without scanning or opening an unrelated locked server file");
+    }
     var manifest = (await http.GetFromJsonAsync<Manifest>("/manifest", Protocol.Json))!;
     var entry = manifest.Files.Single(f => f.Path == "renamed.txt");
     using (var stale = new HttpRequestMessage(HttpMethod.Put, "/file?path=renamed.txt"))
@@ -320,6 +435,90 @@ try
     Assert(server.Activity.Snapshot().Peers.Count == 0, "revocation removes peers from activity");
     client1 = new(cf1, b1);
     await Throws(() => client1.SyncOnceAsync(), "revoked token is rejected");
+    // Replay fixtures represent a stopped process with records newer than its snapshot.
+    string replayServerFolder = Folder("replay-server"), replayClientFolder = Folder("replay-client");
+    var replaySettings = new Settings();
+    int replayPort = FreePort();
+    var replayState = new ServerState { Sequence = 10 };
+    var savedEntry = new FileEntry("saved.txt", Convert.ToHexString(SHA256.HashData("saved content"u8)), 13, "saved-version");
+    var pendingEntry = new FileEntry("pending.txt", Convert.ToHexString(SHA256.HashData("pending content"u8)), 15, "pending-version");
+    replayState.Files[savedEntry.Path] = savedEntry;
+    using (var replayStore = new FolderStore(replayServerFolder))
+    {
+        File.WriteAllText(replayStore.Resolve(savedEntry.Path), "saved content");
+        File.WriteAllText(replayStore.Resolve(pendingEntry.Path), "pending content");
+        DiskJson.Write(Path.Combine(replayStore.Metadata, "server-state.json"), replayState);
+        var replayJournal = new StateJournal<ServerRevision>(replayStore.Metadata, "server-journal");
+        replayJournal.Write(savedEntry.Path, new(9, savedEntry with { Version = "obsolete-version" }));
+        replayJournal.Write(pendingEntry.Path, new(11, pendingEntry));
+    }
+    await using (var replayServer = new SyncServer(replayServerFolder, replaySettings, port: replayPort, saveSettings: () => { }))
+    {
+        await replayServer.StartAsync(enableDiscovery: false);
+        var replayBinding = await SyncClient.PairAsync("127.0.0.1", replayPort, Guid.NewGuid().ToString("N"), replayServer.PairingCode);
+        using var replayHttp = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{replayPort}") };
+        replayHttp.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", replayBinding.Token);
+        replayHttp.DefaultRequestHeaders.Add("X-Sync-Folder", replayBinding.FolderId);
+        var replayManifest = (await replayHttp.GetFromJsonAsync<Manifest>("/manifest", Protocol.Json))!;
+        Assert(replayManifest.Sequence == 11 && replayManifest.Files.Single(f => f.Path == savedEntry.Path).Version == savedEntry.Version &&
+            replayManifest.Files.Single(f => f.Path == pendingEntry.Path).Version == pendingEntry.Version,
+            "server restart replays pending revisions without rolling back checkpointed versions");
+        using (var replayStore = new FolderStore(replayClientFolder))
+        {
+            DiskJson.Write(Path.Combine(replayStore.Metadata, "client-state.json"), new ClientState { ServerId = replayBinding.ServerId, FolderId = replayBinding.FolderId });
+            var replayJournal = new StateJournal<Baseline>(replayStore.Metadata, "client-journal");
+            replayJournal.Write(pendingEntry.Path, new(pendingEntry.Path, pendingEntry.Hash, pendingEntry.Version));
+            // Deletion after the last acknowledged upload must propagate after restart.
+        }
+        await using var replayClient = new SyncClient(replayClientFolder, replayBinding);
+        await replayClient.SyncOnceAsync();
+        Assert(!File.Exists(Path.Combine(replayServerFolder, pendingEntry.Path)) && File.ReadAllText(Path.Combine(replayClientFolder, savedEntry.Path)) == "saved content",
+            "client restart uses journal baseline to propagate an offline deletion");
+    }
+    if (args.Contains("--bulk"))
+    {
+        const int count = 3000;
+        string bulkServerFolder = Folder("bulk-server"), bulkClientFolder = Folder("bulk-client"), bulkDownloadFolder = Folder("bulk-download");
+        byte[] Payload(int i) => System.Text.Encoding.UTF8.GetBytes($"file {i:D4}:" + new string((char)('a' + i % 26), 1024));
+        string Relative(int i) => $"group-{i % 30:D2}/file-{i:D4}.txt";
+        for (int i = 0; i < count; i++)
+        {
+            string path = Path.Combine(bulkClientFolder, Relative(i));
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllBytes(path, Payload(i));
+        }
+        await using var bulkServer = new SyncServer(bulkServerFolder, new Settings(), port: FreePort(), saveSettings: () => { });
+        await bulkServer.StartAsync(enableDiscovery: false);
+        var bulkBinding = await SyncClient.PairAsync("127.0.0.1", bulkServer.Port, Guid.NewGuid().ToString("N"), bulkServer.PairingCode);
+        var duration = Stopwatch.StartNew();
+        long sent;
+        int uploadedFiles = 0, downloadedFiles = 0;
+        void BulkProgress(string message)
+        {
+            if (message.StartsWith("Uploaded:") && ++uploadedFiles % 500 == 0) Console.WriteLine($"BULK upload progress: {uploadedFiles}/{count}");
+            if (message.StartsWith("Downloaded:") && ++downloadedFiles % 500 == 0) Console.WriteLine($"BULK download progress: {downloadedFiles}/{count}");
+        }
+        await using (var bulkClient = new SyncClient(bulkClientFolder, bulkBinding, log: BulkProgress))
+        {
+            await bulkClient.SyncOnceAsync();
+            sent = bulkClient.Activity.Snapshot().Uploaded;
+        }
+        duration.Stop();
+        Console.WriteLine($"BULK upload: {count} files, {sent:N0} bytes, {duration.Elapsed.TotalSeconds:F2}s on loopback.");
+        Assert(Enumerable.Range(0, count).All(i => File.ReadAllBytes(Path.Combine(bulkServerFolder, Relative(i))).SequenceEqual(Payload(i))), "3000-file upload preserves every payload");
+        Assert(Directory.GetFiles(Path.Combine(bulkServerFolder, FolderStore.MetadataName, "history"), "*.txt", SearchOption.AllDirectories).Length == count,
+            "3000-file upload retains one history snapshot per file");
+        var downloadBinding = await SyncClient.PairAsync("127.0.0.1", bulkServer.Port, Guid.NewGuid().ToString("N"), bulkServer.PairingCode);
+        duration.Restart();
+        await using (var downloader = new SyncClient(bulkDownloadFolder, downloadBinding, log: BulkProgress)) await downloader.SyncOnceAsync();
+        duration.Stop();
+        Console.WriteLine($"BULK download: {count} files, {duration.Elapsed.TotalSeconds:F2}s on loopback.");
+        Assert(Enumerable.Range(0, count).All(i => File.ReadAllBytes(Path.Combine(bulkDownloadFolder, Relative(i))).SequenceEqual(Payload(i))), "3000-file fan-out preserves every payload");
+        await using var restartedClient = new SyncClient(bulkClientFolder, bulkBinding);
+        await restartedClient.SyncOnceAsync();
+        Assert(restartedClient.Activity.Snapshot().Uploaded == 0 && restartedClient.Activity.Snapshot().Downloaded == 0,
+            "bulk client restart does not retransmit completed files");
+    }
     Console.WriteLine($"\nAll {passed} checks passed.");
 }
 finally

@@ -19,6 +19,7 @@ public sealed class SyncServer : IAsyncDisposable
     private readonly object pairingLock;
     private readonly Dictionary<string, (DateTime Start, int Count)> attempts = new();
     private ServerState state;
+    private readonly StateJournal<ServerRevision> journal;
     private TaskCompletionSource changed = NewSignal();
     private WebApplication? app;
     private FileSystemWatcher? watcher;
@@ -40,7 +41,16 @@ public sealed class SyncServer : IAsyncDisposable
             history = new(store);
             state = DiskJson.Read<ServerState>(StatePath) ?? new();
             state.Files = new(state.Files, StringComparer.OrdinalIgnoreCase);
+            journal = new(store.Metadata, "server-journal");
+            long checkpointSequence = state.Sequence;
+            foreach (var revision in journal.ReadAll())
+            {
+                if (revision.Sequence <= checkpointSequence) continue;
+                state.Files[revision.Entry.Path] = revision.Entry;
+                state.Sequence = Math.Max(state.Sequence, revision.Sequence);
+            }
             DiskJson.Write(StatePath, state);
+            journal.Checkpoint(StatePath, state, force: true);
             RotatePairingCode();
         }
         catch { store.Dispose(); throw; }
@@ -134,7 +144,7 @@ public sealed class SyncServer : IAsyncDisposable
             await gate.WaitAsync(context.RequestAborted);
             try
             {
-                Scan();
+                Refresh(path);
                 if (!state.Files.TryGetValue(path, out var entry) || entry.Deleted || entry.Version != version) return Results.Conflict();
                 var stream = store.OpenRead(path);
                 try
@@ -164,11 +174,11 @@ public sealed class SyncServer : IAsyncDisposable
                 await gate.WaitAsync(context.RequestAborted);
                 try
                 {
-                    store.Invalidate(); Scan();
+                    Refresh(path);
                     state.Files.TryGetValue(path, out var previous);
                     if (context.Request.Headers["X-Expected-Version"] != (previous?.Version ?? "missing")) return Results.Conflict();
                     store.Apply(path, temp, previous?.Hash, retainRecovery: false);
-                    Scan();
+                    Refresh(path);
                     log("Received " + path);
                     return Results.Json(state.Files[path], Protocol.Json);
                 }
@@ -181,11 +191,11 @@ public sealed class SyncServer : IAsyncDisposable
             await gate.WaitAsync(context.RequestAborted);
             try
             {
-                store.Invalidate(); Scan();
+                Refresh(path);
                 state.Files.TryGetValue(path, out var previous);
                 if (context.Request.Headers["X-Expected-Version"] != (previous?.Version ?? "missing")) return Results.Conflict();
                 store.Apply(path, null, previous?.Hash, retainRecovery: false);
-                Scan();
+                Refresh(path);
                 log("Deleted " + path + " (file history retained)");
                 return Results.Json(state.Files.GetValueOrDefault(path), Protocol.Json);
             }
@@ -194,7 +204,7 @@ public sealed class SyncServer : IAsyncDisposable
         await app.StartAsync(stop.Token);
         watcher = new(store.Root) { IncludeSubdirectories = true, NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size };
         watcher.Changed += OnChange; watcher.Created += OnChange; watcher.Deleted += OnChange; watcher.Renamed += OnChange;
-        watcher.Error += (_, _) => Wake();
+        watcher.Error += (_, _) => { store.Invalidate(); Wake(); };
         watcher.EnableRaisingEvents = true;
         monitor = MonitorAsync();
         if (enableDiscovery) discovery = RunDiscoveryAsync();
@@ -202,7 +212,7 @@ public sealed class SyncServer : IAsyncDisposable
     }
     private void OnChange(object sender, FileSystemEventArgs e)
     {
-        if (!e.FullPath.StartsWith(store.Metadata + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) { store.Invalidate(); Wake(); }
+        if (!e.FullPath.StartsWith(store.Metadata + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) { store.InvalidateChange(e); Wake(); }
     }
     private void Wake() { try { wake.Release(); } catch (SemaphoreFullException) { } }
     private async Task RunDiscoveryAsync()
@@ -213,45 +223,47 @@ public sealed class SyncServer : IAsyncDisposable
     }
     private async Task MonitorAsync()
     {
+        long lastScan = 0;
         while (!stop.IsCancellationRequested)
         {
             try
             {
                 await wake.WaitAsync(TimeSpan.FromSeconds(2), stop.Token);
-                await Task.Delay(150, stop.Token);
+                // Coalesce watcher bursts: uploads verify their own target, so
+                // incoming files must not trigger a full walk every 150 ms.
+                double elapsed = lastScan == 0 ? 2000 : System.Diagnostics.Stopwatch.GetElapsedTime(lastScan).TotalMilliseconds;
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(150, 2000 - elapsed)), stop.Token);
                 await gate.WaitAsync(stop.Token);
-                try { Scan(); } finally { gate.Release(); }
+                try { Scan(); }
+                finally { lastScan = System.Diagnostics.Stopwatch.GetTimestamp(); gate.Release(); }
             }
             catch (OperationCanceledException) when (stop.IsCancellationRequested) { break; }
             catch (Exception e) { log("Waiting for folder: " + e.Message); }
         }
     }
+    private void Refresh(string path) => Publish(path, store.ReadEntry(path, forceHash: true));
+    private void Publish(string path, FileEntry? file)
+    {
+        // History must succeed before publishing a revision, including after a
+        // previously interrupted snapshot. Transfers verify only their target.
+        if (file is not null) history.Capture(file);
+        state.Files.TryGetValue(path, out var old);
+        if (old?.Hash == file?.Hash) return;
+        var entry = file is not null
+            ? file with { Version = Guid.NewGuid().ToString("N") }
+            : old! with { Hash = null, Length = 0, Version = Guid.NewGuid().ToString("N") };
+        long next = checked(state.Sequence + 1);
+        journal.Write(path, new(next, entry));
+        state.Files[path] = entry;
+        state.Sequence = next;
+        var previous = changed; changed = NewSignal(); previous.TrySetResult();
+        journal.Checkpoint(StatePath, state);
+    }
     private void Scan()
     {
         var current = store.Scan();
-        // Seed existing files too, including when upgrading an existing server state.
-        // A failed snapshot must not publish a revision that has no history.
-        foreach (var file in current.Values) history.Capture(file);
-        bool dirty = false;
-        foreach (var file in current.Values)
-        {
-            if (!state.Files.TryGetValue(file.Path, out var old) || old.Hash != file.Hash)
-            {
-                state.Files[file.Path] = file with { Version = Guid.NewGuid().ToString("N") };
-                dirty = true;
-            }
-        }
-        foreach (var old in state.Files.Values.Where(f => !f.Deleted && !current.ContainsKey(f.Path)).ToList())
-        {
-            state.Files[old.Path] = old with { Hash = null, Length = 0, Version = Guid.NewGuid().ToString("N") };
-            dirty = true;
-        }
-        if (dirty)
-        {
-            state.Sequence++;
-            DiskJson.Write(StatePath, state);
-            var previous = changed; changed = NewSignal(); previous.TrySetResult();
-        }
+        foreach (var file in current.Values) Publish(file.Path, file);
+        foreach (var old in state.Files.Values.Where(f => !f.Deleted && !current.ContainsKey(f.Path)).ToList()) Publish(old.Path, null);
     }
     public async ValueTask DisposeAsync()
     {
@@ -260,6 +272,7 @@ public sealed class SyncServer : IAsyncDisposable
         if (monitor is not null) await monitor;
         if (discovery is not null) await discovery;
         Activity.Stop();
-        store.Dispose(); stop.Dispose();
+        try { journal.Checkpoint(StatePath, state, force: true); }
+        finally { store.Dispose(); stop.Dispose(); }
     }
 }

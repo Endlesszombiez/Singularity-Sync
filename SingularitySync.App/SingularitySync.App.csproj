@@ -10,5 +10,6 @@
     <AssemblyName>SingularitySync</AssemblyName>
   </PropertyGroup>
   <ItemGroup><EmbeddedResource Include="Assets/SingularitySync.ico" LogicalName="SingularitySync.AppIcon" /></ItemGroup>
+  <ItemGroup><EmbeddedResource Include="SmbServer.ps1" LogicalName="SingularitySync.SmbServer.ps1" /></ItemGroup>
   <ItemGroup><ProjectReference Include="../SingularitySync.Core/SingularitySync.Core.csproj" /></ItemGroup>
 </Project>

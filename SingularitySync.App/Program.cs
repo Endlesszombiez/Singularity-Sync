@@ -6,12 +6,35 @@ internal static class Program
     private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        if (args.Length == 2 && args[0] == "--smb-diagnostics-test")
+        {
+            try
+            {
+                string result = SmbSetup.RunAsync(new { Action = "connections" }).GetAwaiter().GetResult();
+                try
+                {
+                    SmbSetup.RunAsync(new { Action = "create", Share = "invalid/share", User = "Invalid" }).GetAwaiter().GetResult();
+                    throw new InvalidOperationException("Invalid server setup was accepted.");
+                }
+                catch (IOException e) when (e.Message.Contains("Invalid share")) { result += "\r\nPASS invalid server setup rejected before mutation"; }
+                File.WriteAllText(Path.GetFullPath(args[1]), result);
+            }
+            catch (Exception e) { File.WriteAllText(Path.GetFullPath(args[1]), "FAIL: " + e.Message); Environment.ExitCode = 1; }
+            return;
+        }
+        if (args.Contains("--smb-server-setup"))
+        {
+            try { Application.Run(new SmbServerForm()); }
+            catch (Exception e) { MessageBox.Show(e.Message, "Server setup", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            return;
+        }
         // A stale login entry must not start sharing after the preference or mode changes.
         if (args.Contains("--startup"))
         {
             try
             {
                 var settings = SingularitySync.Core.Settings.Load();
+                if (SmbPreferences.Load().Enabled) return;
                 if (!settings.StartServerAtLogin || settings.Mode != "Server") return;
             }
             catch (Exception e)
